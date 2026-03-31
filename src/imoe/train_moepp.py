@@ -23,6 +23,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="iMoE-moepp")
     parser.add_argument("--data", type=str, default="adni")
     parser.add_argument(
+        "--dreamt_data_dir", type=str, default="data/dreamt"
+    )  # Root directory for DREAMT spectrogram dataset
+    parser.add_argument(
+        "--dreamt_max_files", type=int, default=0
+    )  # Limit number of DREAMT preprocessed files to read (0 = all)
+    parser.add_argument(
         "--modality", type=str, default="IGCB"
     )  # I G C B for ADNI, L N C for MIMIC
     parser.add_argument("--initial_filling", type=str, default="mean")  # None mean
@@ -127,11 +133,15 @@ def main():
         "mimic": 2,
         "mmimdb": 23,
         "enrico": 20,
+        "dreamt": 5,
         "mosi": 2,
         "mosi_regression": 1,
     }
     n_labels = data_to_nlabels[args.data]
-    num_modalities = len(args.modality)
+    if args.data == "dreamt" and "," in args.modality:
+        num_modalities = len([g for g in args.modality.split(",") if g.strip()])
+    else:
+        num_modalities = len(args.modality)
 
     if args.data == "mosi_regression":
         val_losses = []

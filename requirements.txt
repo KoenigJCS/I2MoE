@@ -32,7 +32,7 @@ email_validator==2.2.0
 et-xmlfile==1.1.0
 exceptiongroup==1.2.2
 executing==2.1.0
-fastmoe==1.1.0
+
 filelock 
 fonttools==4.54.1
 frozenlist==1.4.1

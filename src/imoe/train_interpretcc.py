@@ -23,6 +23,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="iMoE-interpretcc")
     parser.add_argument("--data", type=str, default="adni")
     parser.add_argument(
+        "--dreamt_data_dir", type=str, default="data/dreamt"
+    )  # Root directory for DREAMT spectrogram dataset
+    parser.add_argument(
+        "--dreamt_max_files", type=int, default=0
+    )  # Limit number of DREAMT preprocessed files to read (0 = all)
+    parser.add_argument(
         "--modality", type=str, default="IGCB"
     )  # I G C B for ADNI, L N C for MIMIC
     parser.add_argument(
@@ -95,7 +101,11 @@ def main():
     )
     seeds = np.arange(args.n_runs)  # [0, 1, 2]
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
-    num_modalities = num_modality = len(args.modality)
+    if args.data == "dreamt" and "," in args.modality:
+        num_modalities = len([g for g in args.modality.split(",") if g.strip()])
+    else:
+        num_modalities = len(args.modality)
+    num_modality = num_modalities
 
     log_summary = "======================================================================================\n"
 
@@ -126,6 +136,7 @@ def main():
         "mimic": 2,
         "mmimdb": 23,
         "enrico": 20,
+        "dreamt": 5,
         "mosi": 2,
         "mosi_regression": 1,
     }
@@ -155,7 +166,7 @@ def main():
     if len(seeds) == 1:
         fusion_model = InterpretCC(
             num_classes=n_labels,
-            num_modality=len(args.modality),
+            num_modality=num_modalities,
             input_dim=args.hidden_dim,
             dropout=args.dropout,
             tau=args.tau,
@@ -209,7 +220,7 @@ def main():
         for seed in seeds:
             fusion_model = InterpretCC(
                 num_classes=n_labels,
-                num_modality=len(args.modality),
+                num_modality=num_modalities,
                 input_dim=args.hidden_dim,
                 dropout=args.dropout,
                 tau=args.tau,
