@@ -3,6 +3,7 @@ export dreamt_data_dir=data/dreamt
 
 modality_arg=BXYZDTHIJKLMNPQCERFUVWGAO
 dreamt_max_files=0
+dreamt_use_class_weights=True
 n_runs=3
 train_epochs=50
 lr=1e-4
@@ -15,6 +16,10 @@ case "$1" in
         ;;
     --max-files|--dreamt-max-files)
         dreamt_max_files="$2"
+        shift 2
+        ;;
+    --use-class-weights|--dreamt-use-class-weights)
+        dreamt_use_class_weights="$2"
         shift 2
         ;;
     --n-runs)
@@ -76,6 +81,7 @@ CUDA_VISIBLE_DEVICES=$device python src/imoe/train_interpretcc.py \
     --data dreamt \
     --dreamt_data_dir $dreamt_data_dir \
     --dreamt_max_files $dreamt_max_files \
+    --dreamt_use_class_weights $dreamt_use_class_weights \
     --temperature_rw $temperature_rw \
     --hidden_dim_rw $hidden_dim_rw \
     --num_layer_rw $num_layer_rw \

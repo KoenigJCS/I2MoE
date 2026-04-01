@@ -315,22 +315,27 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
         labels_np = np.asarray(labels)
         train_labels = labels_np[np.asarray(train_ids, dtype=np.int64)]
         class_counts = np.bincount(train_labels, minlength=n_labels)
-        class_weights = np.zeros(n_labels, dtype=np.float32)
-        present = class_counts > 0
-        if np.any(present):
-            # Inverse-frequency weighting over classes observed in the train split.
-            class_weights[present] = train_labels.shape[0] / (
-                np.sum(present) * class_counts[present]
+        use_class_weights = bool(getattr(args, "dreamt_use_class_weights", True))
+        if use_class_weights:
+            class_weights = np.zeros(n_labels, dtype=np.float32)
+            present = class_counts > 0
+            if np.any(present):
+                # Inverse-frequency weighting over classes observed in the train split.
+                class_weights[present] = train_labels.shape[0] / (
+                    np.sum(present) * class_counts[present]
+                )
+            else:
+                class_weights += 1.0
+            class_weights_t = torch.tensor(class_weights, dtype=torch.float32).to(device)
+            criterion = torch.nn.CrossEntropyLoss(weight=class_weights_t)
+            print(
+                "DREAMT class weights enabled: "
+                f"{[round(float(w), 4) for w in class_weights_t.detach().cpu().tolist()]}"
             )
         else:
-            class_weights += 1.0
-        class_weights_t = torch.tensor(class_weights, dtype=torch.float32).to(device)
-        criterion = torch.nn.CrossEntropyLoss(weight=class_weights_t)
+            criterion = torch.nn.CrossEntropyLoss()
+            print("DREAMT class weights disabled; using unweighted CrossEntropyLoss.")
         print(f"DREAMT class counts (train): {class_counts.tolist()}")
-        print(
-            "DREAMT class weights: "
-            f"{[round(float(w), 4) for w in class_weights_t.detach().cpu().tolist()]}"
-        )
     elif args.data == "mimic":
         criterion = torch.nn.CrossEntropyLoss(torch.tensor([0.25, 0.75]).to(device))
     elif args.data == "mosi_regression":

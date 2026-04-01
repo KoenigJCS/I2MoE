@@ -43,8 +43,14 @@ TOKEN_TO_MODALITY = {
 	"J": ("eeg_c4_m1", ["C4-M1", "C4_M1", "c4-m1", "c4_m1"]),
 	"K": ("eeg_f4_m1", ["F4-M1", "F4_M1", "f4-m1", "f4_m1"]),
 	"L": ("eeg_o2_m1", ["O2-M1", "O2_M1", "o2-m1", "o2_m1"]),
-	"M": ("eeg_t3_cz", ["T3-CZ", "T3_CZ", "t3-cz", "t3_cz"]),
-	"N": ("eeg_cz_t4", ["CZ-T4", "CZ_T4", "cz-t4", "cz_t4"]),
+	"M": (
+		"eeg_t3_cz",
+		["T3-CZ", "T3_CZ", "t3-cz", "t3_cz", "T3 - CZ", "t3 - cz"],
+	),
+	"N": (
+		"eeg_cz_t4",
+		["CZ-T4", "CZ_T4", "cz-t4", "cz_t4", "CZ - T4", "cz - t4"],
+	),
 	"P": ("eog_e1", ["E1", "e1"]),
 	"Q": ("eog_e2", ["E2", "e2"]),
 	"C": ("chin", ["CHIN", "chin", "EMG", "emg", "EMG_submental"]),
@@ -227,10 +233,14 @@ def _build_dreamt_samples(
 
 	raw_modalities = {token: [] for token in modality_tokens}
 	labels = []
+	missing_token_counts = {token: 0 for token in modality_tokens}
+	first_signal_columns = None
 
 	pair_iter = tqdm(pairs, desc="DREAMT: reading preprocessed files", leave=False)
 	for sig_path, non_sig_path, _ in pair_iter:
 		signal_df = pd.read_csv(sig_path)
+		if first_signal_columns is None:
+			first_signal_columns = signal_df.columns.tolist()
 		non_signal_df = pd.read_csv(non_sig_path)
 		seg_labels = _extract_segment_labels(non_signal_df, sr, segment_seconds)
 		if seg_labels is None:
@@ -238,6 +248,10 @@ def _build_dreamt_samples(
 
 		resolved, _ = _resolve_modality_columns(signal_df, modality_tokens)
 		if resolved is None:
+			for token in modality_tokens:
+				_, candidates = TOKEN_TO_MODALITY.get(token, (token.lower(), [token]))
+				if next((c for c in candidates if c in signal_df.columns), None) is None:
+					missing_token_counts[token] += 1
 			continue
 
 		n_segments = seg_labels.shape[0]
@@ -274,9 +288,26 @@ def _build_dreamt_samples(
 		labels.extend(list(kept_labels))
 
 	if len(labels) == 0:
+		missing_summary = {
+			token: cnt for token, cnt in missing_token_counts.items() if cnt > 0
+		}
+		detail = ""
+		if len(pairs) == 0:
+			detail = (
+				" No paired preprocessed files were found."
+			)
+		elif len(missing_summary) > 0:
+			requested_channels = [TOKEN_TO_MODALITY[t][0] for t in modality_tokens]
+			detail = (
+				f" Requested channels: {requested_channels}. "
+				f"Missing token counts across paired files: {missing_summary}."
+			)
+			if first_signal_columns is not None:
+				detail += f" Example signal columns: {first_signal_columns}."
 		raise ValueError(
 			f"No DREAMT samples found in {data_dir}. "
 			"Expected preprocessed_*.csv and matching preprocessed_non_signal_*.csv files."
+			+ detail
 		)
 
 	return raw_modalities, np.array(labels, dtype=np.int64)

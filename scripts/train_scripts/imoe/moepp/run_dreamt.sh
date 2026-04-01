@@ -3,6 +3,7 @@ export dreamt_data_dir=data/dreamt
 
 modality_arg=BXYZDTHIJKLMNPQCERFUVWGAO
 dreamt_max_files=0
+dreamt_use_class_weights=True
 n_runs=3
 train_epochs=50
 lr=1e-4
@@ -15,6 +16,10 @@ case "$1" in
         ;;
     --max-files|--dreamt-max-files)
         dreamt_max_files="$2"
+        shift 2
+        ;;
+    --use-class-weights|--dreamt-use-class-weights)
+        dreamt_use_class_weights="$2"
         shift 2
         ;;
     --n-runs)
@@ -48,7 +53,7 @@ for lr in $lr
 do
 for modality in "$modality_arg"
 do
-for batch_size in 32
+for batch_size in 128
 do
 for hidden_dim in 64
 do
@@ -79,6 +84,7 @@ CUDA_VISIBLE_DEVICES=$device python src/imoe/train_moepp.py \
     --data dreamt \
     --dreamt_data_dir $dreamt_data_dir \
     --dreamt_max_files $dreamt_max_files \
+    --dreamt_use_class_weights $dreamt_use_class_weights \
     --train_epochs $train_epochs \
     --modality $modality \
     --fusion_sparse False \

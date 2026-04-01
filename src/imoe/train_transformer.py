@@ -29,6 +29,9 @@ def parse_args():
         "--dreamt_max_files", type=int, default=0
     )  # Limit number of DREAMT preprocessed files to read (0 = all)
     parser.add_argument(
+        "--dreamt_use_class_weights", type=str2bool, default=True
+    )  # Toggle class-weighted CE for DREAMT
+    parser.add_argument(
         "--modality", type=str, default="IGCB"
     )  # I G C B for ADNI, L N C for MIMIC
     parser.add_argument("--initial_filling", type=str, default="mean")  # None mean
