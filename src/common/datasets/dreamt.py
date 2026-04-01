@@ -10,7 +10,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as Fnn
 from PIL import Image
 from tqdm import tqdm
 from torchvision.transforms import (
@@ -23,97 +22,28 @@ from torchvision.transforms import (
 	Resize,
 	ToTensor,
 )
-from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights
 
-from src.common.modules.common import Linear, PatchEmbeddings
+from src.common.modules.common import Linear, PatchEmbeddings, VGG11Slim
+from src.common.utils import get_modality_combinations
 
 
 TOKEN_TO_MODALITY = {
-	# Wearable E4 channels
-	"B": ("bvp", ["BVP", "bvp"]),
-	"X": ("acc_x", ["ACC_X", "acc_x"]),
-	"Y": ("acc_y", ["ACC_Y", "acc_y"]),
-	"Z": ("acc_z", ["ACC_Z", "acc_z"]),
-	"D": ("eda", ["EDA", "eda"]),
-	"T": ("temp", ["TEMP", "temp"]),
-	"H": ("hr", ["HR", "hr"]),
-	"I": ("ibi", ["IBI", "ibi"]),
-
-	# PSG channels
-	"J": ("eeg_c4_m1", ["C4-M1", "C4_M1", "c4-m1", "c4_m1"]),
-	"K": ("eeg_f4_m1", ["F4-M1", "F4_M1", "f4-m1", "f4_m1"]),
-	"L": ("eeg_o2_m1", ["O2-M1", "O2_M1", "o2-m1", "o2_m1"]),
-	"M": (
-		"eeg_t3_cz",
-		["T3-CZ", "T3_CZ", "t3-cz", "t3_cz", "T3 - CZ", "t3 - cz"],
-	),
-	"N": (
-		"eeg_cz_t4",
-		["CZ-T4", "CZ_T4", "cz-t4", "cz_t4", "CZ - T4", "cz - t4"],
-	),
-	"P": ("eog_e1", ["E1", "e1"]),
-	"Q": ("eog_e2", ["E2", "e2"]),
-	"C": ("chin", ["CHIN", "chin", "EMG", "emg", "EMG_submental"]),
-	"E": ("ecg", ["ECG", "ecg"]),
-	"R": ("ptaf", ["PTAF", "ptaf"]),
 	"F": ("flow", ["FLOW", "flow", "Resp", "RESP", "resp"]),
-	"U": ("thorax", ["THORAX", "thorax"]),
-	"V": ("abdomen", ["ABDOMEN", "abdomen"]),
-	"W": ("snore", ["SNORE", "snore"]),
-	"G": ("lat", ["LAT", "lat"]),
-	"A": ("rat", ["RAT", "rat"]),
-	"O": ("sao2", ["SAO2", "sao2", "SpO2", "SPO2", "spo2"]),
+	"E": ("ecg", ["ECG", "ecg"]),
+	"C": ("chin", ["CHIN", "chin", "EMG", "emg", "EMG_submental"]),
+	"O": ("spo2", ["SpO2", "SPO2", "spo2"]),
+	"A": ("acc", ["ACC_X", "ACC_Y", "ACC_Z", "acc_x", "acc_y", "acc_z"]),
 }
-
-
-def _parse_modality_groups(modality_arg):
-	raw = str(modality_arg).strip()
-	if not raw:
-		return []
-
-	if "," in raw:
-		groups = [g.strip().upper() for g in raw.split(",") if g.strip()]
-	else:
-		groups = [ch.upper() for ch in raw if ch.strip()]
-
-	parsed = []
-	for group in groups:
-		tokens = [ch for ch in group if ch in TOKEN_TO_MODALITY]
-		if len(tokens) == 0:
-			continue
-		parsed.append(tokens)
-	return parsed
-
-
-def _group_name(tokens):
-	joined = "_".join([TOKEN_TO_MODALITY[t][0] for t in tokens])
-	return f"group_{joined}"
-
-
-def _stack_group_channels(raw_modalities, tokens, sample_idx):
-	parts = [raw_modalities[t][sample_idx] for t in tokens]
-	return np.concatenate(parts, axis=2)
-
-
-def _array_to_resized_tensor(arr, img_dim_y, img_dim_x, normalize_image):
-	tensor = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
-	tensor = Fnn.interpolate(
-		tensor.unsqueeze(0),
-		size=(img_dim_y, img_dim_x),
-		mode="bilinear",
-		align_corners=False,
-	).squeeze(0)
-	if normalize_image:
-		mean = torch.full((tensor.shape[0], 1, 1), 0.5, dtype=tensor.dtype)
-		std = torch.full((tensor.shape[0], 1, 1), 0.5, dtype=tensor.dtype)
-		tensor = (tensor - mean) / std
-	return tensor
 
 
 def _build_transforms(img_dim_x, img_dim_y, normalize_image):
 	train_ops = [
 		ToTensor(),
 		Resize((img_dim_y, img_dim_x)),
+		RandomCrop((img_dim_y, img_dim_x)),
+		RandomHorizontalFlip(),
+		GaussianBlur(3),
+		RandomVerticalFlip(),
 	]
 	eval_ops = [ToTensor(), Resize((img_dim_y, img_dim_x))]
 	if normalize_image:
@@ -233,14 +163,10 @@ def _build_dreamt_samples(
 
 	raw_modalities = {token: [] for token in modality_tokens}
 	labels = []
-	missing_token_counts = {token: 0 for token in modality_tokens}
-	first_signal_columns = None
 
 	pair_iter = tqdm(pairs, desc="DREAMT: reading preprocessed files", leave=False)
 	for sig_path, non_sig_path, _ in pair_iter:
 		signal_df = pd.read_csv(sig_path)
-		if first_signal_columns is None:
-			first_signal_columns = signal_df.columns.tolist()
 		non_signal_df = pd.read_csv(non_sig_path)
 		seg_labels = _extract_segment_labels(non_signal_df, sr, segment_seconds)
 		if seg_labels is None:
@@ -248,10 +174,6 @@ def _build_dreamt_samples(
 
 		resolved, _ = _resolve_modality_columns(signal_df, modality_tokens)
 		if resolved is None:
-			for token in modality_tokens:
-				_, candidates = TOKEN_TO_MODALITY.get(token, (token.lower(), [token]))
-				if next((c for c in candidates if c in signal_df.columns), None) is None:
-					missing_token_counts[token] += 1
 			continue
 
 		n_segments = seg_labels.shape[0]
@@ -288,26 +210,9 @@ def _build_dreamt_samples(
 		labels.extend(list(kept_labels))
 
 	if len(labels) == 0:
-		missing_summary = {
-			token: cnt for token, cnt in missing_token_counts.items() if cnt > 0
-		}
-		detail = ""
-		if len(pairs) == 0:
-			detail = (
-				" No paired preprocessed files were found."
-			)
-		elif len(missing_summary) > 0:
-			requested_channels = [TOKEN_TO_MODALITY[t][0] for t in modality_tokens]
-			detail = (
-				f" Requested channels: {requested_channels}. "
-				f"Missing token counts across paired files: {missing_summary}."
-			)
-			if first_signal_columns is not None:
-				detail += f" Example signal columns: {first_signal_columns}."
 		raise ValueError(
 			f"No DREAMT samples found in {data_dir}. "
 			"Expected preprocessed_*.csv and matching preprocessed_non_signal_*.csv files."
-			+ detail
 		)
 
 	return raw_modalities, np.array(labels, dtype=np.int64)
@@ -339,15 +244,13 @@ def load_and_preprocess_data_dreamt(args):
 	val_split = float(getattr(args, "dreamt_val_split", 0.15))
 	normalize_image = bool(getattr(args, "dreamt_normalize_image", False))
 
-	modality_groups = _parse_modality_groups(args.modality)
-	if len(modality_groups) == 0:
+	modality_tokens = [m.upper() for m in str(args.modality) if m.strip()]
+	if len(modality_tokens) == 0:
 		raise ValueError("args.modality must include at least one modality token.")
-
-	flat_tokens = sorted(set([t for grp in modality_groups for t in grp]))
 
 	raw_modalities, labels = _build_dreamt_samples(
 		data_dir,
-		flat_tokens,
+		modality_tokens,
 		max_files,
 		sr,
 		segment_seconds,
@@ -357,14 +260,8 @@ def load_and_preprocess_data_dreamt(args):
 
 	tqdm.write(
 		f"DREAMT loader: discovered {labels.shape[0]} labeled segments "
-		f"from {data_dir} using modalities {''.join(flat_tokens)}"
+		f"from {data_dir} using modalities {''.join(modality_tokens)}"
 	)
-	selected_names = [
-		TOKEN_TO_MODALITY.get(t, (t.lower(), []))[0] for t in flat_tokens
-	]
-	tqdm.write(f"DREAMT loader: selected channels = {selected_names}")
-	group_descriptions = ["".join(g) for g in modality_groups]
-	tqdm.write(f"DREAMT loader: modality groups (experts) = {group_descriptions}")
 
 	n_samples = labels.shape[0]
 	all_idxs = list(range(n_samples))
@@ -388,11 +285,12 @@ def load_and_preprocess_data_dreamt(args):
 	transforms = {}
 	masks = {}
 
-	observed_idx_arr = np.zeros((n_samples, len(modality_groups)), dtype=bool)
+	observed_idx_arr = np.zeros((n_samples, len(modality_tokens)), dtype=bool)
 	modality_combinations = ["" for _ in range(n_samples)]
 
-	for group_idx, group_tokens in enumerate(modality_groups):
-		modality_name = _group_name(group_tokens)
+	for token_idx, token in enumerate(modality_tokens):
+		modality_name = TOKEN_TO_MODALITY.get(token, (token.lower(), []))[0]
+		modality_imgs = raw_modalities[token]
 		modality_data = []
 		tqdm.write(f"DREAMT loader: building tensors for modality '{modality_name}'")
 		sample_iter = tqdm(
@@ -401,80 +299,36 @@ def load_and_preprocess_data_dreamt(args):
 			leave=False,
 		)
 		for idx in sample_iter:
-			group_arr = _stack_group_channels(raw_modalities, group_tokens, idx)
-			tensor = _array_to_resized_tensor(
-				group_arr,
-				img_dim_y,
-				img_dim_x,
-				normalize_image,
-			)
+			transform = img_transforms_train if idx in train_set else img_transforms_val_test
+			tensor = transform(Image.fromarray(modality_imgs[idx]))
 			modality_data.append(tensor.numpy())
-			observed_idx_arr[idx, group_idx] = True
-			modality_combinations[idx] += modality_name
+			observed_idx_arr[idx, token_idx] = True
+			modality_combinations[idx] += token
 		data_dict[modality_name] = np.stack(modality_data).astype(np.float32)
 
 	device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
-	use_pretrained_convnext = bool(getattr(args, "dreamt_convnext_pretrained", False))
-	freeze_convnext_features = bool(getattr(args, "dreamt_freeze_features", True))
-	convnext_feature_dim = int(getattr(args, "dreamt_convnext_feature_dim", 1024))
-
-	def _build_convnext_encoder_backbone(in_channels):
-		weights = ConvNeXt_Tiny_Weights.DEFAULT if use_pretrained_convnext else None
-		backbone = convnext_tiny(weights=weights)
-		if in_channels != 3:
-			old_conv = backbone.features[0][0]
-			new_conv = torch.nn.Conv2d(
-				in_channels,
-				old_conv.out_channels,
-				kernel_size=old_conv.kernel_size,
-				stride=old_conv.stride,
-				padding=old_conv.padding,
-				bias=(old_conv.bias is not None),
-			)
-			with torch.no_grad():
-				if use_pretrained_convnext:
-					repeat_count = (in_channels + 2) // 3
-					w = old_conv.weight.repeat(1, repeat_count, 1, 1)[:, :in_channels]
-					w = w * (3.0 / float(in_channels))
-					new_conv.weight.copy_(w)
-					if old_conv.bias is not None:
-						new_conv.bias.copy_(old_conv.bias)
-				else:
-					torch.nn.init.kaiming_normal_(
-						new_conv.weight, mode="fan_out", nonlinearity="relu"
-					)
-					if new_conv.bias is not None:
-						new_conv.bias.zero_()
-			backbone.features[0][0] = new_conv
-		in_features = backbone.classifier[2].in_features
-		backbone.classifier[2] = torch.nn.Linear(in_features, convnext_feature_dim)
-		if freeze_convnext_features:
-			for p in backbone.features.parameters():
-				p.requires_grad = False
-		return backbone.to(device)
-
-	for group_tokens in modality_groups:
-		modality_name = _group_name(group_tokens)
-		convnext_backbone = _build_convnext_encoder_backbone(3 * len(group_tokens))
+	for token in modality_tokens:
+		modality_name = TOKEN_TO_MODALITY.get(token, (token.lower(), []))[0]
 		if args.patch:
 			encoder_dict[modality_name] = torch.nn.Sequential(
-				convnext_backbone,
+				VGG11Slim(1024, dropout=True, dropoutp=0.2, freeze_features=True).to(
+					device
+				),
 				PatchEmbeddings(
-					convnext_feature_dim,
-					num_patches=args.num_patches,
-					embed_dim=args.hidden_dim,
+					1024, num_patches=args.num_patches, embed_dim=args.hidden_dim
 				).to(device),
 			)
 		else:
 			encoder_dict[modality_name] = torch.nn.Sequential(
-				convnext_backbone,
-				Linear(convnext_feature_dim, args.hidden_dim, xavier_init=True).to(device),
+				VGG11Slim(1024, dropout=True, dropoutp=0.2, freeze_features=True).to(
+					device
+				),
+				Linear(1024, args.hidden_dim, xavier_init=True).to(device),
 			)
 		input_dims[modality_name] = args.hidden_dim
 
-	full_comb = "|".join([_group_name(g) for g in modality_groups])
-	combination_to_index = {full_comb: 0}
-	modality_combinations = [full_comb for _ in modality_combinations]
+	combination_to_index = get_modality_combinations(args.modality)
+	modality_combinations = ["".join(sorted(set(comb))) for comb in modality_combinations]
 	data_dict["modality_comb"] = [
 		combination_to_index[comb] if comb in combination_to_index else -1
 		for comb in modality_combinations

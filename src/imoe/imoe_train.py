@@ -2,18 +2,11 @@ import torch
 from tqdm import trange
 import numpy as np
 from pathlib import Path
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    roc_auc_score,
-    mean_absolute_error,
-    confusion_matrix,
-)
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, mean_absolute_error
 from copy import deepcopy
 from datetime import datetime
 from fvcore.nn import FlopCountAnalysis, parameter_count
 import time
-import matplotlib.pyplot as plt
 
 from src.common.datasets.adni import load_and_preprocess_data_adni
 from src.common.datasets.mimic import load_and_preprocess_data_mimic
@@ -39,48 +32,7 @@ from src.common.utils import (
 from src.imoe.InteractionMoE import InteractionMoE
 from src.imoe.InteractionMoERegression import InteractionMoERegression
 
-TB_AVAILABLE = False
-try:
-    from torch.utils.tensorboard import SummaryWriter
-
-    TB_AVAILABLE = True
-except Exception:
-    TB_AVAILABLE = False
-
 set_style()
-
-
-def _save_confusion_matrix_figure(
-    cm, save_path, title="Confusion Matrix", return_figure=False
-):
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
-    ax.figure.colorbar(im, ax=ax)
-    ax.set(
-        xticks=np.arange(cm.shape[1]),
-        yticks=np.arange(cm.shape[0]),
-        xlabel="Predicted",
-        ylabel="True",
-        title=title,
-    )
-    thresh = cm.max() / 2.0 if cm.size > 0 else 0.0
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(
-                j,
-                i,
-                int(cm[i, j]),
-                ha="center",
-                va="center",
-                color="white" if cm[i, j] > thresh else "black",
-            )
-    fig.tight_layout()
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(save_path, dpi=150)
-    if return_figure:
-        return fig
-    plt.close(fig)
-    return None
 
 
 def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
@@ -101,25 +53,7 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
     seed_everything(seed)
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     print(device)
-    if args.data == "dreamt" and "," in args.modality:
-        num_modalities = len([g for g in args.modality.split(",") if g.strip()])
-    else:
-        num_modalities = len(args.modality)
-    tb_writer = None
-    use_tensorboard = bool(getattr(args, "use_tensorboard", True))
-    if use_tensorboard and TB_AVAILABLE:
-        run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_log_dir = Path(
-            getattr(args, "tensorboard_log_dir", f"runs/imoe/{fusion}/{args.data}")
-        )
-        tb_log_dir = (
-            base_log_dir
-            / f"mod_{args.modality}_seed_{seed}_{run_stamp}"
-        )
-        tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
-        print(f"TensorBoard logging enabled: {tb_log_dir}")
-    elif use_tensorboard and not TB_AVAILABLE:
-        print("TensorBoard logging requested, but tensorboard is not installed.")
+    num_modalities = len(args.modality)
 
     if args.data == "adni":
         (
@@ -309,33 +243,8 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
     ]
 
     optimizer = torch.optim.Adam(params, lr=args.lr)
-    if args.data in ["adni", "enrico", "mosi", "sarcasm", "humor"]:
+    if args.data in ["adni", "enrico", "dreamt", "mosi", "sarcasm", "humor"]:
         criterion = torch.nn.CrossEntropyLoss()
-    elif args.data == "dreamt":
-        labels_np = np.asarray(labels)
-        train_labels = labels_np[np.asarray(train_ids, dtype=np.int64)]
-        class_counts = np.bincount(train_labels, minlength=n_labels)
-        use_class_weights = bool(getattr(args, "dreamt_use_class_weights", True))
-        if use_class_weights:
-            class_weights = np.zeros(n_labels, dtype=np.float32)
-            present = class_counts > 0
-            if np.any(present):
-                # Inverse-frequency weighting over classes observed in the train split.
-                class_weights[present] = train_labels.shape[0] / (
-                    np.sum(present) * class_counts[present]
-                )
-            else:
-                class_weights += 1.0
-            class_weights_t = torch.tensor(class_weights, dtype=torch.float32).to(device)
-            criterion = torch.nn.CrossEntropyLoss(weight=class_weights_t)
-            print(
-                "DREAMT class weights enabled: "
-                f"{[round(float(w), 4) for w in class_weights_t.detach().cpu().tolist()]}"
-            )
-        else:
-            criterion = torch.nn.CrossEntropyLoss()
-            print("DREAMT class weights disabled; using unweighted CrossEntropyLoss.")
-        print(f"DREAMT class counts (train): {class_counts.tolist()}")
     elif args.data == "mimic":
         criterion = torch.nn.CrossEntropyLoss(torch.tensor([0.25, 0.75]).to(device))
     elif args.data == "mosi_regression":
@@ -356,7 +265,7 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
         plotting_total_losses = {"task": [], "interaction": []}
 
     plotting_interaction_losses = {}
-    for i in range(num_modalities):
+    for i in range(len(args.modality)):
         plotting_interaction_losses[f"uni_{i+1}"] = []
     plotting_interaction_losses[f"syn"] = []
     plotting_interaction_losses[f"red"] = []
@@ -380,7 +289,7 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
             batch_gate_losses = []
         batch_interaction_losses = []
 
-        num_interaction_experts = num_modalities + 2
+        num_interaction_experts = len(args.modality) + 2
         interaction_loss_sums = [0] * (num_interaction_experts)
         minibatch_count = len(train_loader)
 
@@ -410,7 +319,7 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
             else:
                 task_loss = criterion(outputs, batch_labels)
 
-            interaction_loss = sum(interaction_losses) / (num_modalities + 2)
+            interaction_loss = sum(interaction_losses) / (len(args.modality) + 2)
             if args.fusion_sparse:
                 gate_loss = torch.mean(torch.tensor(gate_losses))
                 loss = (
@@ -446,45 +355,16 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
         if args.fusion_sparse:
             plotting_total_losses["gate"].append(np.mean(batch_gate_losses))
 
-        if tb_writer is not None:
-            tb_writer.add_scalar(
-                "train/task_loss", np.mean(batch_task_losses), epoch + 1
-            )
-            tb_writer.add_scalar(
-                "train/interaction_loss", np.mean(batch_interaction_losses), epoch + 1
-            )
-            if args.fusion_sparse:
-                tb_writer.add_scalar(
-                    "train/gate_loss", np.mean(batch_gate_losses), epoch + 1
-                )
-
-        for i in range(num_modalities):
+        for i in range(len(args.modality)):
             avg_loss = interaction_loss_sums[i] / minibatch_count
             plotting_interaction_losses[f"uni_{i+1}"].append(avg_loss)
-            if tb_writer is not None:
-                tb_writer.add_scalar(
-                    f"train/interaction_uni_{i+1}", avg_loss, epoch + 1
-                )
 
         # For syn and red interaction losses
-        syn_loss = interaction_loss_sums[-2] / minibatch_count
-        red_loss = interaction_loss_sums[-1] / minibatch_count
-        plotting_interaction_losses["syn"].append(syn_loss)
-        plotting_interaction_losses["red"].append(red_loss)
-        if tb_writer is not None:
-            tb_writer.add_scalar("train/interaction_syn", syn_loss, epoch + 1)
-            tb_writer.add_scalar("train/interaction_red", red_loss, epoch + 1)
-
-        n_uni_to_print = min(3, num_modalities)
-        uni_losses_to_print = [
-            interaction_loss_sums[i] / minibatch_count for i in range(n_uni_to_print)
-        ]
-        uni_msg = ", ".join(
-            [f"uni_{i+1}: {uni_losses_to_print[i]:.4f}" for i in range(n_uni_to_print)]
+        plotting_interaction_losses["syn"].append(
+            interaction_loss_sums[-2] / minibatch_count
         )
-        print(
-            f"[Epoch {epoch+1}/{args.train_epochs}] Interaction Losses -> "
-            f"{uni_msg}, syn: {syn_loss:.4f}, red: {red_loss:.4f}"
+        plotting_interaction_losses["red"].append(
+            interaction_loss_sums[-1] / minibatch_count
         )
 
         ensemble_model.eval()
@@ -552,9 +432,6 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
             val_acc = accuracy_score(
                 (np.array(all_preds) > 0), (np.array(all_labels) > 0)
             )
-            if tb_writer is not None:
-                tb_writer.add_scalar("val/loss", val_loss, epoch + 1)
-                tb_writer.add_scalar("val/acc", val_acc, epoch + 1)
             print(
                 f"[Seed {seed}/{args.n_runs-1}] [Epoch {epoch+1}/{args.train_epochs}] Task Loss: {np.mean(val_losses):.2f} / Val Loss: {val_loss:.2f}, Val Acc: {val_acc*100:.2f}"
             )
@@ -580,7 +457,6 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
                     }
 
         else:
-            mean_val_loss = float(np.mean(val_losses))
             val_acc = accuracy_score(all_labels, all_preds)
             val_f1 = f1_score(all_labels, all_preds, average="macro")
             val_auc = 0
@@ -591,16 +467,6 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
                     multi_class="ovo",
                     labels=list(range(n_labels)),
                 )
-            elif args.data == "dreamt":
-                try:
-                    val_auc = roc_auc_score(
-                        np.array(all_labels),
-                        np.array(all_probs),
-                        multi_class="ovo",
-                        labels=list(range(n_labels)),
-                    )
-                except ValueError:
-                    val_auc = 0
             elif args.data in ["mimic", "mosi", "sarcasm", "humor"]:
                 val_auc = roc_auc_score(all_labels, all_probs)
             elif args.data == "mmimdb":
@@ -608,35 +474,8 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
             elif args.data == "adni":
                 val_auc = roc_auc_score(all_labels, all_probs, multi_class="ovr")
 
-            val_cm = confusion_matrix(
-                all_labels, all_preds, labels=list(range(n_labels))
-            )
-            cm_save_path = (
-                Path("figures")
-                / "imoe"
-                / fusion
-                / "confusion_matrix"
-                / args.data
-                / f"seed_{seed}_mod_{args.modality}_epoch_{epoch+1}.png"
-            )
-            cm_fig = _save_confusion_matrix_figure(
-                val_cm,
-                cm_save_path,
-                title=f"Val CM ({args.data}) Epoch {epoch+1}",
-                return_figure=(tb_writer is not None),
-            )
-            if tb_writer is not None and cm_fig is not None:
-                tb_writer.add_figure("val/confusion_matrix", cm_fig, epoch + 1)
-                plt.close(cm_fig)
-
-            if tb_writer is not None:
-                tb_writer.add_scalar("val/loss", mean_val_loss, epoch + 1)
-                tb_writer.add_scalar("val/acc", val_acc, epoch + 1)
-                tb_writer.add_scalar("val/f1_macro", val_f1, epoch + 1)
-                tb_writer.add_scalar("val/auc", val_auc, epoch + 1)
-
             print(
-                f"[Seed {seed}/{args.n_runs-1}] [Epoch {epoch+1}/{args.train_epochs}]  Val Loss: {mean_val_loss:.2f}, Val Acc: {val_acc*100:.2f}, Val F1: {val_f1*100:.2f}, Val AUC: {val_auc*100:.2f}"
+                f"[Seed {seed}/{args.n_runs-1}] [Epoch {epoch+1}/{args.train_epochs}]  Val Loss: {val_loss:.2f}, Val Acc: {val_acc*100:.2f}, Val F1: {val_f1*100:.2f}, Val AUC: {val_auc*100:.2f}"
             )
 
             if args.data == "mmimdb":
@@ -736,7 +575,7 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
     all_probs = []
     test_losses = []
     all_routing_weights = []
-    num_experts = num_modalities + 2
+    num_experts = len(args.modality) + 2
     all_expert_outputs = [[] for _ in range(num_experts)]
 
     ############ efficiency
@@ -834,12 +673,6 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
         np.save(save_dir / "all_labels.npy", np.array(all_labels))
         np.save(save_dir / "all_ids.npy", np.array(all_ids))
 
-        if tb_writer is not None:
-            tb_writer.add_scalar("test/acc", test_acc)
-            tb_writer.add_scalar("test/mae", test_mae)
-            tb_writer.flush()
-            tb_writer.close()
-
         return (
             best_val_loss,
             best_val_acc,
@@ -861,16 +694,6 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
                 multi_class="ovo",
                 labels=list(range(n_labels)),
             )
-        elif args.data == "dreamt":
-            try:
-                test_auc = roc_auc_score(
-                    np.array(all_labels),
-                    np.array(all_probs),
-                    multi_class="ovo",
-                    labels=list(range(n_labels)),
-                )
-            except ValueError:
-                test_auc = 0
         elif args.data in ["mimic", "mosi", "sarcasm", "humor"]:
             test_auc = roc_auc_score(all_labels, all_probs)
         elif args.data == "mmimdb":
@@ -888,14 +711,6 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
         np.save(save_dir / "all_preds.npy", np.array(all_preds))
         np.save(save_dir / "all_labels.npy", np.array(all_labels))
         np.save(save_dir / "all_ids.npy", np.array(all_ids))
-
-        if tb_writer is not None:
-            tb_writer.add_scalar("test/acc", test_acc)
-            tb_writer.add_scalar("test/f1_macro", test_f1)
-            tb_writer.add_scalar("test/f1_micro", test_f1_micro)
-            tb_writer.add_scalar("test/auc", test_auc)
-            tb_writer.flush()
-            tb_writer.close()
 
         return (
             best_val_acc,
