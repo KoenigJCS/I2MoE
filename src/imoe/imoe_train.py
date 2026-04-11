@@ -2,7 +2,13 @@ import torch
 from tqdm import trange
 import numpy as np
 from pathlib import Path
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, mean_absolute_error
+from sklearn.metrics import (
+    accuracy_score,
+    cohen_kappa_score,
+    f1_score,
+    mean_absolute_error,
+    roc_auc_score,
+)
 from copy import deepcopy
 from datetime import datetime
 from fvcore.nn import FlopCountAnalysis, parameter_count
@@ -33,6 +39,45 @@ from src.imoe.InteractionMoE import InteractionMoE
 from src.imoe.InteractionMoERegression import InteractionMoERegression
 
 set_style()
+
+
+def _per_class_accuracy(y_true, y_pred, n_labels):
+    per_class = {}
+    for class_idx in range(int(n_labels)):
+        class_mask = y_true == class_idx
+        class_count = int(np.sum(class_mask))
+        if class_count == 0:
+            per_class[str(class_idx)] = None
+            continue
+        class_acc = float(np.mean(y_pred[class_mask] == class_idx))
+        per_class[str(class_idx)] = class_acc
+    return per_class
+
+
+def _label_names_for_dataset(data_name, n_labels):
+    if data_name == "dreamt":
+        return ["W", "N1", "N2", "N3", "REM"]
+    if data_name == "mimic":
+        return ["Negative", "Positive"]
+    if data_name == "mosi":
+        return ["Negative", "Positive"]
+    if data_name == "adni":
+        return ["CN", "MCI", "AD"]
+    return [f"class_{idx}" for idx in range(int(n_labels))]
+
+
+def _rename_per_class_accuracy_keys(per_class_acc, data_name, n_labels):
+    label_names = _label_names_for_dataset(data_name, n_labels)
+    named = {}
+    for class_idx in range(int(n_labels)):
+        key = str(class_idx)
+        label = (
+            label_names[class_idx]
+            if class_idx < len(label_names)
+            else f"class_{class_idx}"
+        )
+        named[label] = per_class_acc.get(key)
+    return named
 
 
 def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
@@ -687,6 +732,11 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
         test_acc = accuracy_score(all_labels, all_preds)
         test_f1 = f1_score(all_labels, all_preds, average="macro")
         test_f1_micro = f1_score(all_labels, all_preds, average="micro")
+        test_kappa = cohen_kappa_score(all_labels, all_preds)
+        test_per_class_acc = _per_class_accuracy(
+            np.array(all_labels), np.array(all_preds), n_labels
+        )
+        test_auc = 0
         if args.data == "enrico":
             test_auc = roc_auc_score(
                 np.array(all_labels),
@@ -711,6 +761,41 @@ def train_and_evaluate_imoe(args, seed, fusion_model, fusion):
         np.save(save_dir / "all_preds.npy", np.array(all_preds))
         np.save(save_dir / "all_labels.npy", np.array(all_labels))
         np.save(save_dir / "all_ids.npy", np.array(all_ids))
+
+        routing_weights_arr = np.array(all_routing_weights)
+        routing_weight_mean_per_expert = None
+        if routing_weights_arr.size > 0 and routing_weights_arr.ndim == 2:
+            routing_weight_mean_per_expert = (
+                np.mean(routing_weights_arr, axis=0).astype(float).tolist()
+            )
+
+        if getattr(args, "return_detailed_metrics", False):
+            named_per_class_acc = _rename_per_class_accuracy_keys(
+                test_per_class_acc, args.data, n_labels
+            )
+            detailed_metrics = {
+                "test_cohen_kappa": float(test_kappa),
+                "test_per_class_accuracy": named_per_class_acc,
+                "routing_weight_mean_per_expert": routing_weight_mean_per_expert,
+                "output_dir": str(save_dir),
+                "train_ids": [int(i) for i in train_ids],
+                "valid_ids": [int(i) for i in valid_ids],
+                "test_ids": [int(i) for i in test_ids],
+            }
+            return (
+                best_val_acc,
+                best_val_f1,
+                best_val_auc,
+                test_acc,
+                test_f1,
+                test_f1_micro,
+                test_auc,
+                train_time / args.train_epochs,
+                infer_time,
+                total_flop,
+                total_param,
+                detailed_metrics,
+            )
 
         return (
             best_val_acc,

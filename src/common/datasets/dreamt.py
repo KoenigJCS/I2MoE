@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 from PIL import Image
 from tqdm import tqdm
+from torchvision.models import ConvNeXt_Tiny_Weights, convnext_tiny
 from torchvision.transforms import (
 	Compose,
 	GaussianBlur,
@@ -23,28 +24,73 @@ from torchvision.transforms import (
 	ToTensor,
 )
 
-from src.common.modules.common import Linear, PatchEmbeddings, VGG11Slim
+from src.common.modules.common import Linear, PatchEmbeddings
 from src.common.utils import get_modality_combinations
 
 
 TOKEN_TO_MODALITY = {
-	"F": ("flow", ["FLOW", "flow", "Resp", "RESP", "resp"]),
+	# Backward-compatible defaults used in existing scripts.
+	"F": ("flow", ["FLOW", "flow"]),
 	"E": ("ecg", ["ECG", "ecg"]),
 	"C": ("chin", ["CHIN", "chin", "EMG", "emg", "EMG_submental"]),
-	"O": ("spo2", ["SpO2", "SPO2", "spo2"]),
-	"A": ("acc", ["ACC_X", "ACC_Y", "ACC_Z", "acc_x", "acc_y", "acc_z"]),
+	# Wearable E4 channels.
+	"A": ("bvp", ["BVP", "bvp"]),
+	"B": ("acc_x", ["ACC_X", "acc_x"]),
+	"D": ("acc_y", ["ACC_Y", "acc_y"]),
+	"G": ("acc_z", ["ACC_Z", "acc_z"]),
+	"H": ("eda", ["EDA", "eda"]),
+	"I": ("temp", ["TEMP", "temp"]),
+	"J": ("hr", ["HR", "hr"]),
+	"K": ("ibi", ["IBI", "ibi"]),
+	# PSG channels.
+	"L": ("c4_m1", ["C4-M1", "C4_M1", "c4-m1", "c4_m1"]),
+	"M": ("f4_m1", ["F4-M1", "F4_M1", "f4-m1", "f4_m1"]),
+	"N": ("o2_m1", ["O2-M1", "O2_M1", "o2-m1", "o2_m1"]),
+	"O": ("t3_cz", ["T3-CZ", "T3_CZ", "t3-cz", "t3_cz"]),
+	"P": ("cz_t4", ["CZ-T4", "CZ_T4", "cz-t4", "cz_t4"]),
+	"Q": ("e1", ["E1", "e1"]),
+	"R": ("e2", ["E2", "e2"]),
+	"S": ("ptaf", ["PTAF", "ptaf"]),
+	"T": ("thorax", ["THORAX", "thorax"]),
+	"U": ("abdomen", ["ABDOMEN", "abdomen"]),
+	"V": ("snore", ["SNORE", "snore"]),
+	"W": ("lat", ["LAT", "lat"]),
+	"X": ("rat", ["RAT", "rat"]),
+	"Y": ("sao2", ["SAO2", "sao2", "SpO2", "SPO2", "spo2"]),
 }
 
 
+def _normalize_name(name):
+	return str(name).strip().upper().replace("-", "_")
+
+
+def _token_order():
+	return list(TOKEN_TO_MODALITY.keys())
+
+
+class ConvNeXtTinyFeatures(torch.nn.Module):
+	"""ConvNeXt-Tiny backbone returning pooled feature vectors (dim=768)."""
+
+	def __init__(self, pretrained=True, freeze_features=True):
+		super().__init__()
+		weights = ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+		try:
+			self.backbone = convnext_tiny(weights=weights)
+		except Exception:
+			# Fall back to random init if pretrained weights are unavailable.
+			self.backbone = convnext_tiny(weights=None)
+		self.backbone.classifier = torch.nn.Identity()
+		if freeze_features:
+			for param in self.backbone.features.parameters():
+				param.requires_grad = False
+
+	def forward(self, x):
+		return self.backbone(x)
+
+
 def _build_transforms(img_dim_x, img_dim_y, normalize_image):
-	train_ops = [
-		ToTensor(),
-		Resize((img_dim_y, img_dim_x)),
-		RandomCrop((img_dim_y, img_dim_x)),
-		RandomHorizontalFlip(),
-		GaussianBlur(3),
-		RandomVerticalFlip(),
-	]
+	# Keep DREAMT preprocessing deterministic and lightweight by default.
+	train_ops = [ToTensor(), Resize((img_dim_y, img_dim_x))]
 	eval_ops = [ToTensor(), Resize((img_dim_y, img_dim_x))]
 	if normalize_image:
 		norm = Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
@@ -111,6 +157,48 @@ def _read_preprocessed_pairs(data_dir):
 		if non_signal.exists():
 			pairs.append((p, non_signal, base))
 	return pairs
+
+
+def _resolve_tokens_from_arg(modality_arg, signal_columns):
+	arg = str(modality_arg).strip()
+	if not arg:
+		raise ValueError("args.modality cannot be empty.")
+
+	available = {_normalize_name(c): c for c in signal_columns}
+	name_to_token = {}
+	for token, (canonical, candidates) in TOKEN_TO_MODALITY.items():
+		name_to_token[_normalize_name(token)] = token
+		name_to_token[_normalize_name(canonical)] = token
+		for cand in candidates:
+			name_to_token[_normalize_name(cand)] = token
+
+	upper_arg = arg.upper()
+	if upper_arg in {"ALL", "*"}:
+		resolved = []
+		for token in _token_order():
+			_, candidates = TOKEN_TO_MODALITY[token]
+			if any(_normalize_name(c) in available for c in candidates):
+				resolved.append(token)
+		if not resolved:
+			raise ValueError("No known DREAMT modality columns found for ALL.")
+		return resolved
+
+	if "," in arg:
+		parts = [p.strip() for p in arg.split(",") if p.strip()]
+	else:
+		parts = list(arg)
+
+	resolved = []
+	for part in parts:
+		token = name_to_token.get(_normalize_name(part))
+		if token is None:
+			raise ValueError(f"Unknown DREAMT modality selector: {part}")
+		if token not in resolved:
+			resolved.append(token)
+
+	if not resolved:
+		raise ValueError("No DREAMT modalities resolved from args.modality")
+	return resolved
 
 
 def _resolve_modality_columns(signal_df, modality_tokens):
@@ -244,9 +332,16 @@ def load_and_preprocess_data_dreamt(args):
 	val_split = float(getattr(args, "dreamt_val_split", 0.15))
 	normalize_image = bool(getattr(args, "dreamt_normalize_image", False))
 
-	modality_tokens = [m.upper() for m in str(args.modality) if m.strip()]
-	if len(modality_tokens) == 0:
-		raise ValueError("args.modality must include at least one modality token.")
+	pairs = _read_preprocessed_pairs(data_dir)
+	if max_files > 0:
+		pairs = pairs[:max_files]
+	if len(pairs) == 0:
+		raise ValueError(
+			f"No DREAMT preprocessed pairs found in {data_dir}. "
+			"Expected preprocessed_*.csv and matching preprocessed_non_signal_*.csv files."
+		)
+	first_signal_df = pd.read_csv(pairs[0][0], nrows=1)
+	modality_tokens = _resolve_tokens_from_arg(args.modality, list(first_signal_df.columns))
 
 	raw_modalities, labels = _build_dreamt_samples(
 		data_dir,
@@ -260,7 +355,7 @@ def load_and_preprocess_data_dreamt(args):
 
 	tqdm.write(
 		f"DREAMT loader: discovered {labels.shape[0]} labeled segments "
-		f"from {data_dir} using modalities {''.join(modality_tokens)}"
+		f"from {data_dir} using modalities {','.join(modality_tokens)}"
 	)
 
 	n_samples = labels.shape[0]
@@ -309,25 +404,23 @@ def load_and_preprocess_data_dreamt(args):
 	device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
 	for token in modality_tokens:
 		modality_name = TOKEN_TO_MODALITY.get(token, (token.lower(), []))[0]
+		feature_dim = 768
+		backbone = ConvNeXtTinyFeatures(pretrained=True, freeze_features=True).to(device)
 		if args.patch:
 			encoder_dict[modality_name] = torch.nn.Sequential(
-				VGG11Slim(1024, dropout=True, dropoutp=0.2, freeze_features=True).to(
-					device
-				),
+				backbone,
 				PatchEmbeddings(
-					1024, num_patches=args.num_patches, embed_dim=args.hidden_dim
+					feature_dim, num_patches=args.num_patches, embed_dim=args.hidden_dim
 				).to(device),
 			)
 		else:
 			encoder_dict[modality_name] = torch.nn.Sequential(
-				VGG11Slim(1024, dropout=True, dropoutp=0.2, freeze_features=True).to(
-					device
-				),
-				Linear(1024, args.hidden_dim, xavier_init=True).to(device),
+				backbone,
+				Linear(feature_dim, args.hidden_dim, xavier_init=True).to(device),
 			)
 		input_dims[modality_name] = args.hidden_dim
 
-	combination_to_index = get_modality_combinations(args.modality)
+	combination_to_index = get_modality_combinations(modality_tokens)
 	modality_combinations = ["".join(sorted(set(comb))) for comb in modality_combinations]
 	data_dict["modality_comb"] = [
 		combination_to_index[comb] if comb in combination_to_index else -1

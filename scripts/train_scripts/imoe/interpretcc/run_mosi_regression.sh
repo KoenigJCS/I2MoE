@@ -45,7 +45,9 @@ CUDA_VISIBLE_DEVICES=$device python src/imoe/train_interpretcc.py \
     --hard True \
     --threshold $threshold \
     --dropout 0.5 \
-    --n_runs 3 \
+    --n_runs ${N_RUNS:-3} \
+    --max_seeds ${SEED_LIMIT:-0} \
+    --results_log ${RESULTS_LOG:-} \
     --interaction_loss_weight $interaction_loss_weight \
     --save False \
     --use_common_ids True 

@@ -31,7 +31,9 @@ CUDA_VISIBLE_DEVICES=$device python src/imoe/train_transformer.py \
     --top_k 2 \
     --num_heads 4 \
     --dropout 0.5 \
-    --n_runs 3 \
+    --n_runs ${N_RUNS:-3} \
+    --max_seeds ${SEED_LIMIT:-0} \
+    --results_log ${RESULTS_LOG:-} \
     --gate_loss_weight 0.01 \
     --save False \
     --use_common_ids True

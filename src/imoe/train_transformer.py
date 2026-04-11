@@ -7,6 +7,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.getcwd())))
 import torch
 import numpy as np
 import argparse
+import json
+from datetime import datetime
 from pathlib import Path
 
 import warnings
@@ -32,6 +34,18 @@ def parse_args():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n_runs", type=int, default=1)
+    parser.add_argument(
+        "--max_seeds",
+        type=int,
+        default=0,
+        help="If > 0, only use the first N seeds from n_runs.",
+    )
+    parser.add_argument(
+        "--results_log",
+        type=str,
+        default="",
+        help="Optional JSONL file path to append final summary metrics.",
+    )
     parser.add_argument(
         "--num_workers", type=int, default=4
     )  # Number of workers for DataLoader
@@ -95,13 +109,38 @@ def parse_args():
 
 def main():
     args, _ = parse_args()
+    args.return_detailed_metrics = True
     logger = setup_logger(
         f"./logs/imoe/transformer/{args.data}",
         f"{args.data}",
         f"{args.modality}.txt",
     )
     seeds = np.arange(args.n_runs)  # [0, 1, 2]
+    if args.max_seeds > 0:
+        seeds = seeds[: args.max_seeds]
+    if len(seeds) == 0:
+        raise ValueError("No seeds selected. Check n_runs/max_seeds.")
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
+
+    results_log_path = (
+        Path(args.results_log)
+        if args.results_log
+        else Path(
+            f"./logs/imoe/transformer/{args.data}/{args.modality}_final_scores.jsonl"
+        )
+    )
+    results_log_path.parent.mkdir(exist_ok=True, parents=True)
+
+    def append_final_scores(payload):
+        payload = dict(payload)
+        payload["timestamp_utc"] = datetime.utcnow().isoformat(timespec="seconds")
+        with open(results_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+
+    def append_generation_scores(payload):
+        payload = dict(payload)
+        payload["record_type"] = "generation"
+        append_final_scores(payload)
 
     log_summary = "======================================================================================\n"
 
@@ -156,6 +195,7 @@ def main():
         test_f1s = []
         test_f1_micros = []
         test_aucs = []
+    generation_logs = []
 
     ############ efficiency
     train_times = []
@@ -196,22 +236,49 @@ def main():
             val_accs.append(val_acc)
             test_accs.append(test_acc)
             test_maes.append(test_mae)
+            generation_payload = {
+                "fusion": "transformer",
+                "data": args.data,
+                "modality": args.modality,
+                "seed": int(args.seed),
+                "val_loss": float(val_loss),
+                "val_acc": float(val_acc * 100),
+                "test_acc": float(test_acc * 100),
+                "test_mae": float(test_mae),
+            }
 
         else:
-
-            (
-                val_acc,
-                val_f1,
-                val_auc,
-                test_acc,
-                test_f1,
-                test_f1_micro,
-                test_auc,
-                train_time,
-                infer_time,
-                flop,
-                param,
-            ) = train_and_evaluate_imoe(args, args.seed, fusion_model, "transformer")
+            run_output = train_and_evaluate_imoe(args, args.seed, fusion_model, "transformer")
+            if len(run_output) == 12:
+                (
+                    val_acc,
+                    val_f1,
+                    val_auc,
+                    test_acc,
+                    test_f1,
+                    test_f1_micro,
+                    test_auc,
+                    train_time,
+                    infer_time,
+                    flop,
+                    param,
+                    run_details,
+                ) = run_output
+            else:
+                (
+                    val_acc,
+                    val_f1,
+                    val_auc,
+                    test_acc,
+                    test_f1,
+                    test_f1_micro,
+                    test_auc,
+                    train_time,
+                    infer_time,
+                    flop,
+                    param,
+                ) = run_output
+                run_details = {}
 
             val_accs.append(val_acc)
             val_f1s.append(val_f1)
@@ -220,11 +287,28 @@ def main():
             test_f1s.append(test_f1)
             test_f1_micros.append(test_f1_micro)
             test_aucs.append(test_auc)
+            generation_payload = {
+                "fusion": "transformer",
+                "data": args.data,
+                "modality": args.modality,
+                "seed": int(args.seed),
+                "val_acc": float(val_acc * 100),
+                "val_f1": float(val_f1 * 100),
+                "val_auc": float(val_auc * 100),
+                "test_acc": float(test_acc * 100),
+                "test_f1_macro": float(test_f1 * 100),
+                "test_f1_micro": float(test_f1_micro * 100),
+                "test_auc": float(test_auc * 100),
+                "test_cohen_kappa": run_details.get("test_cohen_kappa"),
+                "test_per_class_accuracy": run_details.get("test_per_class_accuracy"),
+            }
         ############ efficiency
         train_times.append(train_time)
         infer_times.append(infer_time)
         flops.append(flop)
         params.append(param)
+        generation_logs.append(generation_payload)
+        append_generation_scores(generation_payload)
         ############ efficiency
     else:
         for seed in seeds:
@@ -261,22 +345,49 @@ def main():
                 val_accs.append(val_acc)
                 test_accs.append(test_acc)
                 test_maes.append(test_mae)
+                generation_payload = {
+                    "fusion": "transformer",
+                    "data": args.data,
+                    "modality": args.modality,
+                    "seed": int(args.seed),
+                    "val_loss": float(val_loss),
+                    "val_acc": float(val_acc * 100),
+                    "test_acc": float(test_acc * 100),
+                    "test_mae": float(test_mae),
+                }
 
             else:
-
-                (
-                    val_acc,
-                    val_f1,
-                    val_auc,
-                    test_acc,
-                    test_f1,
-                    test_f1_micro,
-                    test_auc,
-                    train_time,
-                    infer_time,
-                    flop,
-                    param,
-                ) = train_and_evaluate_imoe(args, seed, fusion_model, "transformer")
+                run_output = train_and_evaluate_imoe(args, seed, fusion_model, "transformer")
+                if len(run_output) == 12:
+                    (
+                        val_acc,
+                        val_f1,
+                        val_auc,
+                        test_acc,
+                        test_f1,
+                        test_f1_micro,
+                        test_auc,
+                        train_time,
+                        infer_time,
+                        flop,
+                        param,
+                        run_details,
+                    ) = run_output
+                else:
+                    (
+                        val_acc,
+                        val_f1,
+                        val_auc,
+                        test_acc,
+                        test_f1,
+                        test_f1_micro,
+                        test_auc,
+                        train_time,
+                        infer_time,
+                        flop,
+                        param,
+                    ) = run_output
+                    run_details = {}
 
                 val_accs.append(val_acc)
                 val_f1s.append(val_f1)
@@ -285,11 +396,28 @@ def main():
                 test_f1s.append(test_f1)
                 test_f1_micros.append(test_f1_micro)
                 test_aucs.append(test_auc)
+                generation_payload = {
+                    "fusion": "transformer",
+                    "data": args.data,
+                    "modality": args.modality,
+                    "seed": int(seed),
+                    "val_acc": float(val_acc * 100),
+                    "val_f1": float(val_f1 * 100),
+                    "val_auc": float(val_auc * 100),
+                    "test_acc": float(test_acc * 100),
+                    "test_f1_macro": float(test_f1 * 100),
+                    "test_f1_micro": float(test_f1_micro * 100),
+                    "test_auc": float(test_auc * 100),
+                    "test_cohen_kappa": run_details.get("test_cohen_kappa"),
+                    "test_per_class_accuracy": run_details.get("test_per_class_accuracy"),
+                }
             ############ efficiency
             train_times.append(train_time)
             infer_times.append(infer_time)
             flops.append(flop)
             params.append(param)
+            generation_logs.append(generation_payload)
+            append_generation_scores(generation_payload)
             ############ efficiency
 
     ############ efficiency
@@ -385,6 +513,45 @@ def main():
         )
 
     logger.info(log_summary)
+
+    if args.data == "mosi_regression":
+        final_scores = {
+            "fusion": "transformer",
+            "data": args.data,
+            "modality": args.modality,
+            "seeds": [int(s) for s in seeds.tolist()],
+            "val_acc_mean": float(val_avg_acc),
+            "val_acc_std": float(val_std_acc),
+            "val_loss_mean": float(val_avg_loss),
+            "val_loss_std": float(val_std_loss),
+            "test_acc_mean": float(test_avg_acc),
+            "test_acc_std": float(test_std_acc),
+            "test_mae_mean": float(test_avg_mae),
+            "test_mae_std": float(test_std_mae),
+        }
+    else:
+        final_scores = {
+            "fusion": "transformer",
+            "data": args.data,
+            "modality": args.modality,
+            "seeds": [int(s) for s in seeds.tolist()],
+            "val_acc_mean": float(val_avg_acc),
+            "val_acc_std": float(val_std_acc),
+            "val_f1_mean": float(val_avg_f1),
+            "val_f1_std": float(val_std_f1),
+            "val_auc_mean": float(val_avg_auc),
+            "val_auc_std": float(val_std_auc),
+            "test_acc_mean": float(test_avg_acc),
+            "test_acc_std": float(test_std_acc),
+            "test_f1_macro_mean": float(test_avg_f1),
+            "test_f1_macro_std": float(test_std_f1),
+            "test_f1_micro_mean": float(test_avg_f1_micro),
+            "test_f1_micro_std": float(test_std_f1_micro),
+            "test_auc_mean": float(test_avg_auc),
+            "test_auc_std": float(test_std_auc),
+        }
+    append_final_scores(final_scores)
+    print(f"Final scores appended to: {results_log_path}")
 
 
 if __name__ == "__main__":
