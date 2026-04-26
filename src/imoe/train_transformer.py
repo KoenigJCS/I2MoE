@@ -30,6 +30,18 @@ def parse_args():
     parser.add_argument(
         "--modality", type=str, default="IGCB"
     )  # I G C B for ADNI, L N C for MIMIC
+    parser.add_argument(
+        "--modalities",
+        type=str,
+        default="",
+        help="Alias for --modality (e.g., ULE for DREAMT).",
+    )
+    parser.add_argument(
+        "--experts",
+        type=str,
+        default="",
+        help="Per-modality expert codes, e.g., CAC (C=ConvNeXt, A=AttnSleep-style).",
+    )
     parser.add_argument("--initial_filling", type=str, default="mean")  # None mean
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
@@ -104,11 +116,60 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.5)  # Number of Routers
     parser.add_argument("--gate_loss_weight", type=float, default=1e-2)
 
+    parser.add_argument(
+        "--use_uncertainty_estimator",
+        type=str2bool,
+        default=False,
+        help="Enable post-hoc uncertainty estimator trained on a held-out calibration slice.",
+    )
+    parser.add_argument(
+        "--uncertainty_calibration_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of train ids reserved for uncertainty calibration.",
+    )
+    parser.add_argument(
+        "--uncertainty_epochs",
+        type=int,
+        default=5,
+        help="Training epochs for uncertainty estimator.",
+    )
+    parser.add_argument(
+        "--uncertainty_lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for uncertainty estimator.",
+    )
+    parser.add_argument(
+        "--uncertainty_weight_decay",
+        type=float,
+        default=0.0,
+        help="Weight decay for uncertainty estimator optimizer.",
+    )
+    parser.add_argument(
+        "--uncertainty_base_channels",
+        type=int,
+        default=16,
+        help="Base channels for 4-layer CNN uncertainty estimator.",
+    )
+    parser.add_argument(
+        "--uncertainty_eval_levels",
+        type=str,
+        default="0.5,0.7,0.8,0.9",
+        help="Comma-separated uncertainty thresholds for test subset metrics.",
+    )
+
     return parser.parse_known_args()
 
 
 def main():
     args, _ = parse_args()
+
+    if str(getattr(args, "modalities", "")).strip():
+        args.modality = str(args.modalities).strip()
+    args.modality = str(args.modality).strip()
+    args.experts = str(getattr(args, "experts", "")).strip().upper()
+
     args.return_detailed_metrics = True
     logger = setup_logger(
         f"./logs/imoe/transformer/{args.data}",
@@ -142,6 +203,19 @@ def main():
         payload["record_type"] = "generation"
         append_final_scores(payload)
 
+    append_final_scores(
+        {
+            "record_type": "run_start",
+            "fusion": "transformer",
+            "data": args.data,
+            "modality": args.modality,
+            "experts": args.experts,
+            "seeds": [int(s) for s in seeds.tolist()],
+            "use_uncertainty_estimator": bool(args.use_uncertainty_estimator),
+            "uncertainty_eval_levels": args.uncertainty_eval_levels,
+        }
+    )
+
     log_summary = "======================================================================================\n"
 
     model_kwargs = {
@@ -152,6 +226,7 @@ def main():
         "num_layer_rw": args.num_layer_rw,
         "interaction_loss_weight": args.interaction_loss_weight,
         "modality": args.modality,
+        "experts": args.experts,
         "data": args.data,
         "gate_loss_weight": args.gate_loss_weight,
         "interaction_loss_weight": args.interaction_loss_weight,
@@ -164,11 +239,16 @@ def main():
         "batch_size": args.batch_size,
         "hidden_dim": args.hidden_dim,
         "num_patches": args.num_patches,
+        "use_uncertainty_estimator": args.use_uncertainty_estimator,
+        "uncertainty_calibration_ratio": args.uncertainty_calibration_ratio,
+        "uncertainty_epochs": args.uncertainty_epochs,
     }
 
     log_summary += f"Model configuration: {model_kwargs}\n"
 
     print("Modality:", args.modality)
+    if args.experts:
+        print("Experts:", args.experts)
 
     data_to_nlabels = {
         "adni": 3,
@@ -301,6 +381,16 @@ def main():
                 "test_auc": float(test_auc * 100),
                 "test_cohen_kappa": run_details.get("test_cohen_kappa"),
                 "test_per_class_accuracy": run_details.get("test_per_class_accuracy"),
+                "uncertainty_test_bce": run_details.get("uncertainty_test_bce"),
+                "uncertainty_test_auc": run_details.get("uncertainty_test_auc"),
+                "uncertainty_test_accuracy": run_details.get("uncertainty_test_accuracy"),
+                "uncertainty_threshold_metrics": run_details.get(
+                    "uncertainty_threshold_metrics"
+                ),
+                "uncertainty_calibration_bce": run_details.get(
+                    "uncertainty_calibration_bce"
+                ),
+                "best_epoch_count": len(run_details.get("best_epoch_events", [])),
             }
         ############ efficiency
         train_times.append(train_time)
@@ -410,6 +500,16 @@ def main():
                     "test_auc": float(test_auc * 100),
                     "test_cohen_kappa": run_details.get("test_cohen_kappa"),
                     "test_per_class_accuracy": run_details.get("test_per_class_accuracy"),
+                    "uncertainty_test_bce": run_details.get("uncertainty_test_bce"),
+                    "uncertainty_test_auc": run_details.get("uncertainty_test_auc"),
+                    "uncertainty_test_accuracy": run_details.get("uncertainty_test_accuracy"),
+                    "uncertainty_threshold_metrics": run_details.get(
+                        "uncertainty_threshold_metrics"
+                    ),
+                    "uncertainty_calibration_bce": run_details.get(
+                        "uncertainty_calibration_bce"
+                    ),
+                    "best_epoch_count": len(run_details.get("best_epoch_events", [])),
                 }
             ############ efficiency
             train_times.append(train_time)

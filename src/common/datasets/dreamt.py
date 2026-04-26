@@ -88,6 +88,58 @@ class ConvNeXtTinyFeatures(torch.nn.Module):
 		return self.backbone(x)
 
 
+class AttnSleepStyleFeatures(torch.nn.Module):
+	"""AttnSleep-style 1D encoder for flattened DREAMT spectrograms."""
+
+	def __init__(self, out_dim=256, dropout=0.5):
+		super().__init__()
+		self.branch_short = torch.nn.Sequential(
+			torch.nn.Conv1d(1, 64, kernel_size=50, stride=6, bias=False, padding=24),
+			torch.nn.BatchNorm1d(64),
+			torch.nn.GELU(),
+			torch.nn.MaxPool1d(kernel_size=8, stride=2, padding=4),
+			torch.nn.Dropout(dropout),
+			torch.nn.Conv1d(64, 128, kernel_size=8, stride=1, bias=False, padding=4),
+			torch.nn.BatchNorm1d(128),
+			torch.nn.GELU(),
+			torch.nn.Conv1d(128, 128, kernel_size=8, stride=1, bias=False, padding=4),
+			torch.nn.BatchNorm1d(128),
+			torch.nn.GELU(),
+			torch.nn.MaxPool1d(kernel_size=4, stride=4, padding=2),
+		)
+		self.branch_long = torch.nn.Sequential(
+			torch.nn.Conv1d(1, 64, kernel_size=400, stride=50, bias=False, padding=200),
+			torch.nn.BatchNorm1d(64),
+			torch.nn.GELU(),
+			torch.nn.MaxPool1d(kernel_size=4, stride=2, padding=2),
+			torch.nn.Dropout(dropout),
+			torch.nn.Conv1d(64, 128, kernel_size=7, stride=1, bias=False, padding=3),
+			torch.nn.BatchNorm1d(128),
+			torch.nn.GELU(),
+			torch.nn.Conv1d(128, 128, kernel_size=7, stride=1, bias=False, padding=3),
+			torch.nn.BatchNorm1d(128),
+			torch.nn.GELU(),
+			torch.nn.MaxPool1d(kernel_size=2, stride=2, padding=1),
+		)
+		self.merge = torch.nn.Sequential(
+			torch.nn.Dropout(dropout),
+			torch.nn.Conv1d(128, 128, kernel_size=3, stride=1, padding=1, bias=False),
+			torch.nn.BatchNorm1d(128),
+			torch.nn.GELU(),
+			torch.nn.AdaptiveAvgPool1d(1),
+		)
+		self.head = torch.nn.Linear(128, int(out_dim))
+
+	def forward(self, x):
+		# Convert RGB spectrogram image tensors [B, 3, H, W] into [B, 1, H*W].
+		x = x.mean(dim=1, keepdim=True).reshape(x.shape[0], 1, -1)
+		x1 = self.branch_short(x)
+		x2 = self.branch_long(x)
+		x = torch.cat((x1, x2), dim=2)
+		x = self.merge(x).squeeze(-1)
+		return self.head(x)
+
+
 def _build_transforms(img_dim_x, img_dim_y, normalize_image):
 	# Keep DREAMT preprocessing deterministic and lightweight by default.
 	train_ops = [ToTensor(), Resize((img_dim_y, img_dim_x))]
@@ -199,6 +251,36 @@ def _resolve_tokens_from_arg(modality_arg, signal_columns):
 	if not resolved:
 		raise ValueError("No DREAMT modalities resolved from args.modality")
 	return resolved
+
+
+def _resolve_experts_from_arg(experts_arg, modality_tokens):
+	arg = str(experts_arg).strip() if experts_arg is not None else ""
+	if not arg:
+		return ["C"] * len(modality_tokens)
+
+	if "," in arg:
+		parts = [p.strip().upper() for p in arg.split(",") if p.strip()]
+	else:
+		parts = list(arg.upper())
+
+	if len(parts) == 1 and len(modality_tokens) > 1:
+		parts = parts * len(modality_tokens)
+
+	if len(parts) != len(modality_tokens):
+		raise ValueError(
+			"args.experts length ({}) must match resolved modalities ({})".format(
+				len(parts), len(modality_tokens)
+			)
+		)
+
+	for code in parts:
+		if code not in {"C", "A"}:
+			raise ValueError(
+				"Unsupported expert code '{}' in args.experts. Supported: C=ConvNeXt, A=AttnSleep-style".format(
+					code
+				)
+			)
+	return parts
 
 
 def _resolve_modality_columns(signal_df, modality_tokens):
@@ -342,6 +424,7 @@ def load_and_preprocess_data_dreamt(args):
 		)
 	first_signal_df = pd.read_csv(pairs[0][0], nrows=1)
 	modality_tokens = _resolve_tokens_from_arg(args.modality, list(first_signal_df.columns))
+	expert_codes = _resolve_experts_from_arg(getattr(args, "experts", ""), modality_tokens)
 
 	raw_modalities, labels = _build_dreamt_samples(
 		data_dir,
@@ -402,10 +485,22 @@ def load_and_preprocess_data_dreamt(args):
 		data_dict[modality_name] = np.stack(modality_data).astype(np.float32)
 
 	device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
-	for token in modality_tokens:
+	for token, expert_code in zip(modality_tokens, expert_codes):
 		modality_name = TOKEN_TO_MODALITY.get(token, (token.lower(), []))[0]
-		feature_dim = 768
-		backbone = ConvNeXtTinyFeatures(pretrained=True, freeze_features=True).to(device)
+		if expert_code == "A":
+			feature_dim = int(getattr(args, "dreamt_attnsleep_feature_dim", 256))
+			backbone = AttnSleepStyleFeatures(out_dim=feature_dim).to(device)
+			backbone_name = "AttnSleep-style"
+		else:
+			feature_dim = 768
+			backbone = ConvNeXtTinyFeatures(pretrained=True, freeze_features=True).to(device)
+			backbone_name = "ConvNeXt"
+
+		tqdm.write(
+			"DREAMT loader: modality '{}' (token {}) uses {} expert".format(
+				modality_name, token, backbone_name
+			)
+		)
 		if args.patch:
 			encoder_dict[modality_name] = torch.nn.Sequential(
 				backbone,
